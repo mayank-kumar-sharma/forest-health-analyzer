@@ -1,6 +1,6 @@
-streamlit
-numpy
-Pillow
-opencv-python-headless
-fpdf
-scipy
+streamlit==1.32.0
+numpy==1.26.4
+Pillow==10.2.0
+opencv-python-headless==4.9.0.80
+fpdf==1.7.2
+scipy==1.11.4
