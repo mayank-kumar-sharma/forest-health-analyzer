@@ -176,7 +176,9 @@ def draw_crown_detections(image_np, centers, radius=10):
 def overlay_health_on_original(image_np, health_map, alpha=0.5):
     blended = cv2.addWeighted(image_np, 1 - alpha, health_map, alpha, 0)
     return blended
-
+def sanitize(text):
+    """Remove any characters that FPDF cannot handle"""
+    return str(text).encode("latin-1", errors="ignore").decode("latin-1")
 def generate_pdf_report(canopy_pct, health_scores, tree_count, raw_count, threshold_used, image_name, mode):
     pdf = FPDF()
     pdf.add_page()
@@ -197,12 +199,13 @@ def generate_pdf_report(canopy_pct, health_scores, tree_count, raw_count, thresh
     pdf.ln(6)
 
     # Clean mode string — remove emojis for PDF
-    clean_mode = mode.replace("🌳", "").replace("🌾", "").strip()
+    clean_mode = sanitize(mode.replace("🌳", "").replace("🌾", "").strip())
+    clean_image_name = sanitize(image_name)
 
     pdf.set_font("Arial", "", 11)
     pdf.set_text_color(80, 80, 80)
-    pdf.cell(0, 8, f"Image Analyzed: {image_name}", ln=True)
-    pdf.cell(0, 8, f"Analysis Mode: {clean_mode}", ln=True)
+    pdf.cell(0, 8, sanitize(f"Image Analyzed: {clean_image_name}"), ln=True)
+    pdf.cell(0, 8, sanitize(f"Analysis Mode: {clean_mode}"), ln=True)
     pdf.cell(0, 8, f"Adaptive Threshold Used: {threshold_used:.2f}", ln=True)
     pdf.ln(4)
 
