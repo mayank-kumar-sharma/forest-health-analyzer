@@ -4,9 +4,12 @@ from PIL import Image
 import cv2
 import tempfile
 import os
-from fpdf import FPDF
 from scipy.spatial.distance import cdist
-from scipy import ndimage
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -33,11 +36,11 @@ def calculate_exg(image_np):
     return exg, R, G, B
 
 def generate_vegetation_mask(exg, G, R, B, k=K_VALUE, mode="🌳 Sparse Forest / Dryland"):
-    # Adaptive threshold with clip
+    # Adaptive threshold with clip — fixes threshold explosion
     threshold = np.mean(exg) + k * np.std(exg)
     threshold = np.clip(threshold, 10, 40)
 
-    # Green ratio — relaxed for agriculture mode
+    # Green ratio filter — fixes desert false positives and soil
     green_ratio = G / (R + B + 1e-6)
 
     if mode == "🌾 Agriculture / Plantation (Experimental)":
@@ -47,6 +50,7 @@ def generate_vegetation_mask(exg, G, R, B, k=K_VALUE, mode="🌳 Sparse Forest /
 
     mask = ((exg > threshold) & (green_ratio > green_ratio_threshold)).astype(np.uint8) * 255
 
+    # Morphological cleaning
     kernel = np.ones((3, 3), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask = cv2.dilate(mask, kernel, iterations=1)
@@ -59,8 +63,11 @@ def generate_health_map(exg, mask):
     health_map = np.zeros((height, width, 3), dtype=np.uint8)
     strong_threshold = np.mean(exg[mask == 255]) if np.sum(mask == 255) > 0 else 40
 
+    # Strong vegetation
     health_map[(mask == 255) & (exg > strong_threshold)] = [0, 180, 0]
+    # Weak vegetation
     health_map[(mask == 255) & (exg <= strong_threshold)] = [255, 200, 0]
+    # Non vegetated
     health_map[mask == 0] = [180, 0, 0]
 
     return health_map
@@ -84,40 +91,21 @@ def calculate_health_scores(exg, mask):
     }
 
 def detect_crowns_distance_transform(mask, mode, min_blob, max_blob, min_spacing):
-    # -----------------------------
-    # STEP 1 — Distance Transform
-    # Each vegetation pixel gets a value =
-    # how far it is from the nearest non-vegetation pixel
-    # Tree crown centers = highest distance values = peaks
-    # -----------------------------
     binary = (mask > 0).astype(np.uint8)
     dist_transform = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
-
-    # Normalize for visualization
     dist_normalized = cv2.normalize(dist_transform, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
-    # -----------------------------
-    # STEP 2 — Find local peaks
-    # Use mode-specific blur to control sensitivity
-    # Agriculture = smaller blur = more peaks = more trees detected
-    # Forest = larger blur = fewer peaks = less noise
-    # -----------------------------
     if mode == "🌾 Agriculture / Plantation (Experimental)":
-        blur_size = 3   # small blur — keeps nearby crowns separate
+        blur_size = 3
+        peak_threshold = 0.3
     else:
-        blur_size = 5   # larger blur — reduces noise in sparse forest
+        blur_size = 5
+        peak_threshold = 0.4
 
     dist_blurred = cv2.GaussianBlur(dist_normalized, (blur_size, blur_size), 0)
 
-    # -----------------------------
-    # STEP 3 — Threshold peaks
-    # Only keep pixels that are local maxima
-    # (peak of each crown hill)
-    # -----------------------------
-    if mode == "🌾 Agriculture / Plantation (Experimental)":
-        peak_threshold = 0.3   # more sensitive — catches smaller crowns
-    else:
-        peak_threshold = 0.4   # stricter — avoids noise peaks
+    if dist_blurred.max() == 0:
+        return 0, [], 0, dist_normalized
 
     _, peak_mask = cv2.threshold(
         dist_blurred,
@@ -126,19 +114,11 @@ def detect_crowns_distance_transform(mask, mode, min_blob, max_blob, min_spacing
         cv2.THRESH_BINARY
     )
 
-    # -----------------------------
-    # STEP 4 — Label connected regions
-    # Each separate peak region = one tree
-    # -----------------------------
     peak_mask = peak_mask.astype(np.uint8)
     num_labels, labeled, stats, centroids = cv2.connectedComponentsWithStats(peak_mask)
 
-    # -----------------------------
-    # STEP 5 — Filter by size and collect valid centers
-    # Remove background label (0) and filter by blob area
-    # -----------------------------
     valid_centers = []
-    for i in range(1, num_labels):   # skip background label 0
+    for i in range(1, num_labels):
         area = stats[i, cv2.CC_STAT_AREA]
         if min_blob <= area <= max_blob:
             cx, cy = int(centroids[i][0]), int(centroids[i][1])
@@ -146,10 +126,6 @@ def detect_crowns_distance_transform(mask, mode, min_blob, max_blob, min_spacing
 
     raw_count = len(valid_centers)
 
-    # -----------------------------
-    # STEP 6 — Distance based filtering
-    # Remove duplicate detections of same tree
-    # -----------------------------
     if len(valid_centers) == 0:
         return 0, [], 0, dist_normalized
 
@@ -176,106 +152,138 @@ def draw_crown_detections(image_np, centers, radius=10):
 def overlay_health_on_original(image_np, health_map, alpha=0.5):
     blended = cv2.addWeighted(image_np, 1 - alpha, health_map, alpha, 0)
     return blended
-def sanitize(text):
-    """Remove any characters that FPDF cannot handle"""
-    return str(text).encode("latin-1", errors="ignore").decode("latin-1")
-def generate_pdf_report(canopy_pct, health_scores, tree_count, raw_count, threshold_used, image_name, mode):
-    pdf = FPDF()
-    pdf.add_page()
 
-    # Title
-    pdf.set_font("Arial", "B", 20)
-    pdf.set_text_color(31, 92, 58)
-    pdf.cell(0, 12, "Flora Carbon AI", ln=True, align="C")
+def get_crown_message(canopy_pct, tree_count):
+    if tree_count > 0:
+        return None
+    if canopy_pct > 60:
+        return (
+            "⚠️ Dense canopy detected — vegetation coverage is very high but individual "
+            "tree crowns are too overlapping to separate. This image type requires model "
+            "training for accurate tree counting. Canopy coverage and health metrics are still valid."
+        )
+    elif canopy_pct < 10:
+        return (
+            "⚠️ Very low vegetation detected in this image. "
+            "Try uploading an image with more visible tree cover."
+        )
+    else:
+        return (
+            "⚠️ Vegetation detected but no separable tree crowns found. "
+            "Try lowering the Minimum Crown Size slider or switch to Agriculture mode."
+        )
 
-    pdf.set_font("Arial", "B", 14)
-    pdf.set_text_color(50, 50, 50)
-    pdf.cell(0, 8, "Drone Image Vegetation Analysis Report", ln=True, align="C")
-    pdf.ln(4)
+def generate_pdf_report(canopy_pct, health_scores, tree_count, raw_count,
+                        threshold_used, image_name, mode, crown_message):
 
-    pdf.set_draw_color(31, 92, 58)
-    pdf.set_line_width(0.8)
-    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-    pdf.ln(6)
+    pdf_path = tempfile.mktemp(suffix=".pdf")
+    doc = SimpleDocTemplate(
+        pdf_path, pagesize=A4,
+        rightMargin=20*mm, leftMargin=20*mm,
+        topMargin=20*mm, bottomMargin=20*mm
+    )
 
-    # Clean mode string — remove emojis for PDF
-    clean_mode = sanitize(mode.replace("🌳", "").replace("🌾", "").strip())
-    clean_image_name = sanitize(image_name)
+    green = colors.HexColor("#1F5C3A")
+    grey = colors.HexColor("#555555")
+    light_grey = colors.HexColor("#888888")
+    orange = colors.HexColor("#cc6600")
 
-    pdf.set_font("Arial", "", 11)
-    pdf.set_text_color(80, 80, 80)
-    pdf.cell(0, 8, sanitize(f"Image Analyzed: {clean_image_name}"), ln=True)
-    pdf.cell(0, 8, sanitize(f"Analysis Mode: {clean_mode}"), ln=True)
-    pdf.cell(0, 8, f"Adaptive Threshold Used: {threshold_used:.2f}", ln=True)
-    pdf.ln(4)
+    title_style = ParagraphStyle(
+        "title", fontSize=20, textColor=green,
+        alignment=1, spaceAfter=4, fontName="Helvetica-Bold"
+    )
+    subtitle_style = ParagraphStyle(
+        "subtitle", fontSize=14, textColor=grey,
+        alignment=1, spaceAfter=10, fontName="Helvetica-Bold"
+    )
+    section_style = ParagraphStyle(
+        "section", fontSize=13, textColor=green,
+        spaceAfter=4, spaceBefore=10, fontName="Helvetica-Bold"
+    )
+    body_style = ParagraphStyle(
+        "body", fontSize=11, textColor=grey,
+        spaceAfter=3, fontName="Helvetica", leftIndent=10
+    )
+    note_style = ParagraphStyle(
+        "note", fontSize=9, textColor=light_grey,
+        spaceAfter=3, fontName="Helvetica-Oblique", leftIndent=10
+    )
+    warning_style = ParagraphStyle(
+        "warning", fontSize=10, textColor=orange,
+        spaceAfter=3, fontName="Helvetica-Oblique", leftIndent=10
+    )
+    footer_style = ParagraphStyle(
+        "footer", fontSize=10, textColor=green,
+        alignment=1, fontName="Helvetica-Bold"
+    )
+
+    # Clean strings — ascii safe
+    clean_mode = mode.replace("🌳", "").replace("🌾", "").strip()
+    clean_mode = clean_mode.encode("ascii", errors="ignore").decode("ascii")
+    clean_image = image_name.encode("ascii", errors="ignore").decode("ascii")
+
+    story = []
+
+    story.append(Paragraph("Flora Carbon AI", title_style))
+    story.append(Paragraph("Drone Image Vegetation Analysis Report", subtitle_style))
+    story.append(HRFlowable(width="100%", thickness=1, color=green))
+    story.append(Spacer(1, 6*mm))
+
+    story.append(Paragraph(f"Image Analyzed: {clean_image}", body_style))
+    story.append(Paragraph(f"Analysis Mode: {clean_mode}", body_style))
+    story.append(Paragraph(f"Adaptive Threshold Used: {threshold_used:.2f}", body_style))
+    story.append(Spacer(1, 4*mm))
 
     # Section 1
-    pdf.set_font("Arial", "B", 13)
-    pdf.set_text_color(31, 92, 58)
-    pdf.cell(0, 8, "1. Canopy Coverage", ln=True)
-    pdf.set_font("Arial", "", 11)
-    pdf.set_text_color(50, 50, 50)
-    pdf.cell(0, 8, f"   Canopy Coverage: {canopy_pct}%", ln=True)
-    pdf.ln(3)
+    story.append(Paragraph("1. Canopy Coverage", section_style))
+    story.append(Paragraph(f"Canopy Coverage: {canopy_pct}%", body_style))
 
     # Section 2
-    pdf.set_font("Arial", "B", 13)
-    pdf.set_text_color(31, 92, 58)
-    pdf.cell(0, 8, "2. Vegetation Health Breakdown", ln=True)
-    pdf.set_font("Arial", "", 11)
-    pdf.set_text_color(50, 50, 50)
-    pdf.cell(0, 8, f"   Strong Vegetation  : {health_scores['strong_pct']}%", ln=True)
-    pdf.cell(0, 8, f"   Weak Vegetation    : {health_scores['weak_pct']}%", ln=True)
-    pdf.cell(0, 8, f"   Non-Vegetated Area : {health_scores['nonveg_pct']}%", ln=True)
-    pdf.ln(3)
+    story.append(Paragraph("2. Vegetation Health Breakdown", section_style))
+    story.append(Paragraph(f"Strong Vegetation   : {health_scores['strong_pct']}%", body_style))
+    story.append(Paragraph(f"Weak Vegetation     : {health_scores['weak_pct']}%", body_style))
+    story.append(Paragraph(f"Non-Vegetated Area  : {health_scores['nonveg_pct']}%", body_style))
 
     # Section 3
-    pdf.set_font("Arial", "B", 13)
-    pdf.set_text_color(31, 92, 58)
-    pdf.cell(0, 8, "3. Tree Crown Count", ln=True)
-    pdf.set_font("Arial", "", 11)
-    pdf.set_text_color(50, 50, 50)
-    pdf.cell(0, 8, f"   Raw Detections (before filtering): {raw_count}", ln=True)
-    pdf.cell(0, 8, f"   Final Count (after duplicate removal): {tree_count}", ln=True)
-    pdf.ln(3)
+    story.append(Paragraph("3. Tree Crown Count", section_style))
+    story.append(Paragraph(f"Raw Detections (before filtering): {raw_count}", body_style))
+    story.append(Paragraph(f"Final Count (after duplicate removal): {tree_count}", body_style))
+
+    if crown_message:
+        clean_msg = crown_message.encode("ascii", errors="ignore").decode("ascii")
+        story.append(Spacer(1, 2*mm))
+        story.append(Paragraph(clean_msg, warning_style))
 
     # Section 4
-    pdf.set_font("Arial", "B", 13)
-    pdf.set_text_color(31, 92, 58)
-    pdf.cell(0, 8, "4. Methodology", ln=True)
-    pdf.set_font("Arial", "", 11)
-    pdf.set_text_color(50, 50, 50)
-    pdf.multi_cell(0, 7,
+    story.append(Paragraph("4. Methodology", section_style))
+    story.append(Paragraph(
         "Vegetation detection uses Excess Green Index (ExG = 2G - R - B) combined "
         "with Green Ratio filter (G / R+B) for improved soil and desert rejection. "
         "Adaptive threshold is clipped between 10-40 for stability. "
-        "Crown separation uses Distance Transform — each crown creates a distance peak, "
-        "even touching crowns produce separate peaks. "
-        "Local maxima detection finds crown centers. "
-        "Distance-based filtering removes duplicate detections."
-    )
-    pdf.ln(3)
+        "Crown separation uses Distance Transform so even touching crowns produce "
+        "separate peaks. Local maxima detection finds crown centers. "
+        "Distance-based filtering removes duplicate detections.",
+        body_style
+    ))
 
-    pdf.set_font("Arial", "I", 10)
-    pdf.set_text_color(120, 120, 120)
-    pdf.multi_cell(0, 7,
+    story.append(Spacer(1, 4*mm))
+    story.append(Paragraph(
         "Accuracy Note: Health Map 65-75% | Canopy Coverage 75-85% | "
         "Tree Count 70-85% sparse/plantation | 50-65% dense canopy. "
         "Optimized for sparse forests, orchards, plantations, and agroforestry. "
-        "Results are for project scoping only. Ground truth validation recommended."
-    )
+        "Results are for project scoping only. Ground truth validation recommended.",
+        note_style
+    ))
 
-    pdf.ln(4)
-    pdf.set_draw_color(31, 92, 58)
-    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-    pdf.ln(6)
+    story.append(Spacer(1, 6*mm))
+    story.append(HRFlowable(width="100%", thickness=1, color=green))
+    story.append(Spacer(1, 4*mm))
+    story.append(Paragraph(
+        "Made with love by Mayank Kumar Sharma | Flora Carbon AI",
+        footer_style
+    ))
 
-    pdf.set_font("Arial", "B", 10)
-    pdf.set_text_color(31, 92, 58)
-    pdf.cell(0, 8, "Made with love by Mayank Kumar Sharma | Flora Carbon AI", ln=True, align="C")
-
-    pdf_path = tempfile.mktemp(suffix=".pdf")
-    pdf.output(pdf_path)
+    doc.build(story)
     return pdf_path
 
 
@@ -332,7 +340,7 @@ if uploaded_file:
         default_max_blob = 8000
         default_spacing = 15
     else:
-        default_min_blob = 30
+        default_min_blob = 15
         default_max_blob = 3000
         default_spacing = 8
 
@@ -376,7 +384,9 @@ if uploaded_file:
 
             image_np = load_image(uploaded_file)
             exg, R, G, B = calculate_exg(image_np)
-            mask, threshold_used = generate_vegetation_mask(exg, G, R, B, k=k_value, mode=mode)
+            mask, threshold_used = generate_vegetation_mask(
+                exg, G, R, B, k=k_value, mode=mode
+            )
             health_map = generate_health_map(exg, mask)
             canopy_pct = calculate_canopy_coverage(mask)
             health_scores = calculate_health_scores(exg, mask)
@@ -396,6 +406,8 @@ if uploaded_file:
             else:
                 display_health = health_map
 
+            crown_message = get_crown_message(canopy_pct, tree_count)
+
         st.success("✅ Analysis Complete!")
         st.markdown("---")
 
@@ -407,7 +419,7 @@ if uploaded_file:
             st.image(tree_image, caption=f"Crowns Detected: {tree_count}", use_column_width=True)
 
         if show_distance:
-            st.image(dist_map, caption="Distance Transform Map (crown peaks = bright spots)", use_column_width=True)
+            st.image(dist_map, caption="Distance Transform Map (bright = crown peaks)", use_column_width=True)
 
         st.markdown("---")
         st.subheader("📊 Results Summary")
@@ -434,15 +446,19 @@ if uploaded_file:
             f"Duplicates removed: {raw_count - tree_count}"
         )
 
-        st.markdown("---")
-        st.warning(
-            "⚠️ Accuracy Note: Health Map ~65-75% | Canopy ~75-85% | "
-            "Tree Count ~70-85% sparse / ~50-65% dense. "
-            "For carbon verification, ground truth validation is recommended."
-        )
+        # Crown detection message
+        if crown_message:
+            st.warning(crown_message)
+        else:
+            st.warning(
+                "⚠️ Accuracy Note: Health Map ~65-75% | Canopy ~75-85% | "
+                "Tree Count ~70-85% sparse / ~50-65% dense. "
+                "For carbon verification, ground truth validation is recommended."
+            )
 
         st.markdown("---")
         st.subheader("📄 Download Report")
+
         pdf_path = generate_pdf_report(
             canopy_pct=canopy_pct,
             health_scores=health_scores,
@@ -450,8 +466,10 @@ if uploaded_file:
             raw_count=raw_count,
             threshold_used=threshold_used,
             image_name=uploaded_file.name,
-            mode=mode
+            mode=mode,
+            crown_message=crown_message
         )
+
         with open(pdf_path, "rb") as f:
             st.download_button(
                 label="📥 Download PDF Report",
