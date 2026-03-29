@@ -46,9 +46,9 @@ def generate_vegetation_mask(exg, G, R, B, k=K_VALUE, mode="🌳 Sparse Forest /
     green_ratio = G / (R + B + 1e-6)
 
     if mode == "🌾 Agriculture / Plantation (Experimental)":
-    green_ratio_threshold = 0.6
+       green_ratio_threshold = 0.6
     else:
-    green_ratio_threshold = 0.55  # desert trees are dusty green
+       green_ratio_threshold = 0.55  # desert trees are dusty green
 
     mask = ((exg > threshold) & (green_ratio > green_ratio_threshold)).astype(np.uint8) * 255
 
