@@ -8,7 +8,7 @@ from scipy.spatial.distance import cdist
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
 import warnings
 warnings.filterwarnings("ignore")
@@ -17,6 +17,8 @@ warnings.filterwarnings("ignore")
 # Config / Constants
 # -----------------------------
 K_VALUE = 0.5
+MIN_BLOB_AREA = 100
+MAX_BLOB_AREA = 8000
 MIN_TREE_SPACING = 15
 
 # -----------------------------
@@ -36,11 +38,11 @@ def calculate_exg(image_np):
     return exg, R, G, B
 
 def generate_vegetation_mask(exg, G, R, B, k=K_VALUE, mode="🌳 Sparse Forest / Dryland"):
-    # Adaptive threshold with clip — fixes threshold explosion
+    # Adaptive threshold with clip
     threshold = np.mean(exg) + k * np.std(exg)
     threshold = np.clip(threshold, 10, 40)
 
-    # Green ratio filter — fixes desert false positives and soil
+    # Green ratio filter
     green_ratio = G / (R + B + 1e-6)
 
     if mode == "🌾 Agriculture / Plantation (Experimental)":
@@ -50,7 +52,6 @@ def generate_vegetation_mask(exg, G, R, B, k=K_VALUE, mode="🌳 Sparse Forest /
 
     mask = ((exg > threshold) & (green_ratio > green_ratio_threshold)).astype(np.uint8) * 255
 
-    # Morphological cleaning
     kernel = np.ones((3, 3), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask = cv2.dilate(mask, kernel, iterations=1)
@@ -63,11 +64,8 @@ def generate_health_map(exg, mask):
     health_map = np.zeros((height, width, 3), dtype=np.uint8)
     strong_threshold = np.mean(exg[mask == 255]) if np.sum(mask == 255) > 0 else 40
 
-    # Strong vegetation
     health_map[(mask == 255) & (exg > strong_threshold)] = [0, 180, 0]
-    # Weak vegetation
     health_map[(mask == 255) & (exg <= strong_threshold)] = [255, 200, 0]
-    # Non vegetated
     health_map[mask == 0] = [180, 0, 0]
 
     return health_map
@@ -90,63 +88,68 @@ def calculate_health_scores(exg, mask):
         "nonveg_pct": round((non_veg / total_pixels) * 100, 2)
     }
 
-def detect_crowns_distance_transform(mask, mode, min_blob, max_blob, min_spacing):
-    binary = (mask > 0).astype(np.uint8)
-    dist_transform = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
-    dist_normalized = cv2.normalize(dist_transform, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+def filter_by_distance(keypoints, min_spacing=MIN_TREE_SPACING):
+    if len(keypoints) == 0:
+        return keypoints
 
+    points = np.array([[kp.pt[0], kp.pt[1]] for kp in keypoints])
+    sizes = np.array([kp.size for kp in keypoints])
+    sorted_idx = np.argsort(-sizes)
+    points = points[sorted_idx]
+    keypoints_sorted = [keypoints[i] for i in sorted_idx]
+
+    kept = []
+    kept_points = []
+
+    for i, kp in enumerate(keypoints_sorted):
+        pt = points[i]
+        if len(kept_points) == 0:
+            kept.append(kp)
+            kept_points.append(pt)
+        else:
+            dists = cdist([pt], kept_points)[0]
+            if np.min(dists) >= min_spacing:
+                kept.append(kp)
+                kept_points.append(pt)
+
+    return kept
+
+def count_trees_blob(mask, mode, min_blob, max_blob, min_spacing):
     if mode == "🌾 Agriculture / Plantation (Experimental)":
         blur_size = 3
-        peak_threshold = 0.3
     else:
         blur_size = 5
-        peak_threshold = 0.4
 
-    dist_blurred = cv2.GaussianBlur(dist_normalized, (blur_size, blur_size), 0)
+    smoothed = cv2.GaussianBlur(mask, (blur_size, blur_size), 0)
+    inverted = cv2.bitwise_not(smoothed)
 
-    if dist_blurred.max() == 0:
-        return 0, [], 0, dist_normalized
+    params = cv2.SimpleBlobDetector_Params()
+    params.filterByArea = True
+    params.minArea = min_blob
+    params.maxArea = max_blob
 
-    _, peak_mask = cv2.threshold(
-        dist_blurred,
-        peak_threshold * dist_blurred.max(),
-        255,
-        cv2.THRESH_BINARY
-    )
+    params.filterByCircularity = True
+    if mode == "🌾 Agriculture / Plantation (Experimental)":
+        params.minCircularity = 0.2
+    else:
+        params.minCircularity = 0.3
 
-    peak_mask = peak_mask.astype(np.uint8)
-    num_labels, labeled, stats, centroids = cv2.connectedComponentsWithStats(peak_mask)
+    params.filterByConvexity = False
+    params.filterByInertia = False
 
-    valid_centers = []
-    for i in range(1, num_labels):
-        area = stats[i, cv2.CC_STAT_AREA]
-        if min_blob <= area <= max_blob:
-            cx, cy = int(centroids[i][0]), int(centroids[i][1])
-            valid_centers.append((cx, cy))
+    detector = cv2.SimpleBlobDetector_create(params)
+    raw_keypoints = detector.detect(inverted)
+    filtered_keypoints = filter_by_distance(raw_keypoints, min_spacing=min_spacing)
 
-    raw_count = len(valid_centers)
+    return len(filtered_keypoints), filtered_keypoints, len(raw_keypoints)
 
-    if len(valid_centers) == 0:
-        return 0, [], 0, dist_normalized
-
-    centers = np.array(valid_centers)
-    kept_centers = []
-
-    for pt in centers:
-        if len(kept_centers) == 0:
-            kept_centers.append(pt)
-        else:
-            dists = cdist([pt], kept_centers)[0]
-            if np.min(dists) >= min_spacing:
-                kept_centers.append(pt)
-
-    return len(kept_centers), kept_centers, raw_count, dist_normalized
-
-def draw_crown_detections(image_np, centers, radius=10):
+def draw_tree_detections(image_np, keypoints):
     result = image_np.copy()
-    for (cx, cy) in centers:
-        cv2.circle(result, (cx, cy), radius, (0, 255, 255), 2)
-        cv2.circle(result, (cx, cy), 3, (0, 255, 255), -1)
+    for kp in keypoints:
+        x, y = int(kp.pt[0]), int(kp.pt[1])
+        radius = max(int(kp.size / 2), 8)
+        cv2.circle(result, (x, y), radius, (0, 255, 255), 2)
+        cv2.circle(result, (x, y), 3, (0, 255, 255), -1)
     return result
 
 def overlay_health_on_original(image_np, health_map, alpha=0.5):
@@ -158,19 +161,19 @@ def get_crown_message(canopy_pct, tree_count):
         return None
     if canopy_pct > 60:
         return (
-            "⚠️ Dense canopy detected — vegetation coverage is very high but individual "
-            "tree crowns are too overlapping to separate. This image type requires model "
-            "training for accurate tree counting. Canopy coverage and health metrics are still valid."
+            "Dense canopy detected — vegetation coverage is very high but individual "
+            "tree crowns are too overlapping to separate. Canopy and health metrics are still valid. "
+            "For accurate tree counting on dense canopy, model training is required."
         )
     elif canopy_pct < 10:
         return (
-            "⚠️ Very low vegetation detected in this image. "
+            "Very low vegetation detected in this image. "
             "Try uploading an image with more visible tree cover."
         )
     else:
         return (
-            "⚠️ Vegetation detected but no separable tree crowns found. "
-            "Try lowering the Minimum Crown Size slider or switch to Agriculture mode."
+            "Vegetation detected but no separable tree crowns found. "
+            "Try lowering the Minimum Crown Size slider or switching to Agriculture mode."
         )
 
 def generate_pdf_report(canopy_pct, health_scores, tree_count, raw_count,
@@ -217,7 +220,6 @@ def generate_pdf_report(canopy_pct, health_scores, tree_count, raw_count,
         alignment=1, fontName="Helvetica-Bold"
     )
 
-    # Clean strings — ascii safe
     clean_mode = mode.replace("🌳", "").replace("🌾", "").strip()
     clean_mode = clean_mode.encode("ascii", errors="ignore").decode("ascii")
     clean_image = image_name.encode("ascii", errors="ignore").decode("ascii")
@@ -234,35 +236,30 @@ def generate_pdf_report(canopy_pct, health_scores, tree_count, raw_count,
     story.append(Paragraph(f"Adaptive Threshold Used: {threshold_used:.2f}", body_style))
     story.append(Spacer(1, 4*mm))
 
-    # Section 1
     story.append(Paragraph("1. Canopy Coverage", section_style))
     story.append(Paragraph(f"Canopy Coverage: {canopy_pct}%", body_style))
 
-    # Section 2
     story.append(Paragraph("2. Vegetation Health Breakdown", section_style))
     story.append(Paragraph(f"Strong Vegetation   : {health_scores['strong_pct']}%", body_style))
     story.append(Paragraph(f"Weak Vegetation     : {health_scores['weak_pct']}%", body_style))
     story.append(Paragraph(f"Non-Vegetated Area  : {health_scores['nonveg_pct']}%", body_style))
 
-    # Section 3
     story.append(Paragraph("3. Tree Crown Count", section_style))
     story.append(Paragraph(f"Raw Detections (before filtering): {raw_count}", body_style))
     story.append(Paragraph(f"Final Count (after duplicate removal): {tree_count}", body_style))
 
     if crown_message:
-        clean_msg = crown_message.encode("ascii", errors="ignore").decode("ascii")
         story.append(Spacer(1, 2*mm))
-        story.append(Paragraph(clean_msg, warning_style))
+        clean_msg = crown_message.encode("ascii", errors="ignore").decode("ascii")
+        story.append(Paragraph(f"Note: {clean_msg}", warning_style))
 
-    # Section 4
     story.append(Paragraph("4. Methodology", section_style))
     story.append(Paragraph(
         "Vegetation detection uses Excess Green Index (ExG = 2G - R - B) combined "
         "with Green Ratio filter (G / R+B) for improved soil and desert rejection. "
-        "Adaptive threshold is clipped between 10-40 for stability. "
-        "Crown separation uses Distance Transform so even touching crowns produce "
-        "separate peaks. Local maxima detection finds crown centers. "
-        "Distance-based filtering removes duplicate detections.",
+        "Adaptive threshold is clipped between 10-40 for stability across image types. "
+        "Morphological cleaning removes noise. Crown detection uses blob detection "
+        "with circularity filter and distance-based duplicate removal.",
         body_style
     ))
 
@@ -373,11 +370,6 @@ if uploaded_file:
         value=True
     )
 
-    show_distance = st.checkbox(
-        "Show Distance Transform map (crown separation debug view)",
-        value=False
-    )
-
     if st.button("🔍 Analyze Vegetation"):
 
         with st.spinner("Analyzing image..."):
@@ -391,7 +383,7 @@ if uploaded_file:
             canopy_pct = calculate_canopy_coverage(mask)
             health_scores = calculate_health_scores(exg, mask)
 
-            tree_count, centers, raw_count, dist_map = detect_crowns_distance_transform(
+            tree_count, keypoints, raw_count = count_trees_blob(
                 mask,
                 mode=mode,
                 min_blob=min_blob,
@@ -399,7 +391,7 @@ if uploaded_file:
                 min_spacing=min_spacing
             )
 
-            tree_image = draw_crown_detections(image_np, centers)
+            tree_image = draw_tree_detections(image_np, keypoints)
 
             if show_overlay:
                 display_health = overlay_health_on_original(image_np, health_map, alpha=0.5)
@@ -417,9 +409,6 @@ if uploaded_file:
             st.markdown("🟢 Strong Vegetation &nbsp; 🟡 Weak Vegetation &nbsp; 🔴 Non-Vegetated")
         with col2:
             st.image(tree_image, caption=f"Crowns Detected: {tree_count}", use_column_width=True)
-
-        if show_distance:
-            st.image(dist_map, caption="Distance Transform Map (bright = crown peaks)", use_column_width=True)
 
         st.markdown("---")
         st.subheader("📊 Results Summary")
@@ -446,7 +435,6 @@ if uploaded_file:
             f"Duplicates removed: {raw_count - tree_count}"
         )
 
-        # Crown detection message
         if crown_message:
             st.warning(crown_message)
         else:
@@ -482,3 +470,5 @@ if uploaded_file:
 # Footer
 st.markdown("---")
 st.markdown("💡 Made with ❤️ by **Mayank Kumar Sharma** | Flora Carbon AI")
+
+scipy
