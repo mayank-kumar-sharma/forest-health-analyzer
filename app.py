@@ -40,15 +40,15 @@ def calculate_exg(image_np):
 def generate_vegetation_mask(exg, G, R, B, k=K_VALUE, mode="🌳 Sparse Forest / Dryland"):
     # Adaptive threshold with clip
     threshold = np.mean(exg) + k * np.std(exg)
-    threshold = np.clip(threshold, 10, 40)
+    threshold = np.clip(threshold, 5, 25)  # desert images have low ExG values
 
     # Green ratio filter
     green_ratio = G / (R + B + 1e-6)
 
     if mode == "🌾 Agriculture / Plantation (Experimental)":
-        green_ratio_threshold = 0.6
+    green_ratio_threshold = 0.6
     else:
-        green_ratio_threshold = 0.9
+    green_ratio_threshold = 0.55  # desert trees are dusty green
 
     mask = ((exg > threshold) & (green_ratio > green_ratio_threshold)).astype(np.uint8) * 255
 
