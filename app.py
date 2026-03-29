@@ -470,5 +470,3 @@ if uploaded_file:
 # Footer
 st.markdown("---")
 st.markdown("💡 Made with ❤️ by **Mayank Kumar Sharma** | Flora Carbon AI")
-
-scipy
