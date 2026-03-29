@@ -38,18 +38,17 @@ def calculate_exg(image_np):
     return exg, R, G, B
 
 def generate_vegetation_mask(exg, G, R, B, k=K_VALUE, mode="🌳 Sparse Forest / Dryland"):
-    # Adaptive threshold with clip
     threshold = np.mean(exg) + k * np.std(exg)
-
-    # Green ratio filter
     green_ratio = G / (R + B + 1e-6)
 
     if mode == "🌾 Agriculture / Plantation (Experimental)":
-        green_ratio_threshold = 0.75   # bright green plantation
-        threshold = np.clip(threshold, 15, 35)  # higher for bright green
+        # Bright green plantation orchards — citrus, mango, round crown rows
+        green_ratio_threshold = 0.75
+        threshold = np.clip(threshold, 15, 35)
     else:
-        green_ratio_threshold = 0.55   # dusty green dryland trees
-        threshold = np.clip(threshold, 5, 25)   # lower for desert images
+        # Dusty green dryland trees — desert, savanna, olive, sparse forest
+        green_ratio_threshold = 0.55
+        threshold = np.clip(threshold, 5, 25)
 
     mask = ((exg > threshold) & (green_ratio > green_ratio_threshold)).astype(np.uint8) * 255
 
@@ -157,24 +156,30 @@ def overlay_health_on_original(image_np, health_map, alpha=0.5):
     blended = cv2.addWeighted(image_np, 1 - alpha, health_map, alpha, 0)
     return blended
 
-def get_crown_message(canopy_pct, tree_count):
+def get_crown_message(canopy_pct, tree_count, mode):
     if tree_count > 0:
         return None
     if canopy_pct > 60:
         return (
-            "Dense canopy detected — vegetation coverage is very high but individual "
-            "tree crowns are too overlapping to separate. Canopy and health metrics are still valid. "
-            "For accurate tree counting on dense canopy, model training is required."
+            "Dense canopy detected — tree crowns are too overlapping to separate individually. "
+            "Canopy coverage and health metrics are still valid. "
+            "For precise tree counting on dense canopy, model training is required."
         )
     elif canopy_pct < 10:
-        return (
-            "Very low vegetation detected in this image. "
-            "Try uploading an image with more visible tree cover."
-        )
+        if mode == "🌾 Agriculture / Plantation (Experimental)":
+            return (
+                "Very low vegetation detected. For plantation images make sure the image is "
+                "taken from directly above with clearly visible round tree crowns and soil gaps between rows."
+            )
+        else:
+            return (
+                "Very low vegetation detected. For best results use images with clearly "
+                "visible individual trees on dry or sandy background."
+            )
     else:
         return (
             "Vegetation detected but no separable tree crowns found. "
-            "Try lowering the Minimum Crown Size slider or switching to Agriculture mode."
+            "Try lowering the Minimum Crown Size slider or adjusting the Threshold Sensitivity."
         )
 
 def generate_pdf_report(canopy_pct, health_scores, tree_count, raw_count,
@@ -257,8 +262,8 @@ def generate_pdf_report(canopy_pct, health_scores, tree_count, raw_count,
     story.append(Paragraph("4. Methodology", section_style))
     story.append(Paragraph(
         "Vegetation detection uses Excess Green Index (ExG = 2G - R - B) combined "
-        "with Green Ratio filter (G / R+B) for improved soil and desert rejection. "
-        "Adaptive threshold is clipped between 10-40 for stability across image types. "
+        "with Green Ratio filter (G / R+B) for improved soil and background rejection. "
+        "Adaptive threshold is mode-specific for stability across image types. "
         "Morphological cleaning removes noise. Crown detection uses blob detection "
         "with circularity filter and distance-based duplicate removal.",
         body_style
@@ -267,9 +272,9 @@ def generate_pdf_report(canopy_pct, health_scores, tree_count, raw_count,
     story.append(Spacer(1, 4*mm))
     story.append(Paragraph(
         "Accuracy Note: Health Map 65-75% | Canopy Coverage 75-85% | "
-        "Tree Count 70-85% sparse/plantation | 50-65% dense canopy. "
-        "Optimized for sparse forests, orchards, plantations, and agroforestry. "
-        "Results are for project scoping only. Ground truth validation recommended.",
+        "Tree Count 70-85% sparse/dryland | 60-75% plantation rows. "
+        "Results are for project scoping only. "
+        "Ground truth validation recommended for carbon credit verification.",
         note_style
     ))
 
@@ -291,20 +296,18 @@ def generate_pdf_report(canopy_pct, health_scores, tree_count, raw_count,
 
 st.title("🌳 Flora Carbon AI — Vegetation Analyzer")
 
-st.success(
-    "✅ Works best with: Sparse forests, orchards, plantations, agroforestry plots, "
-    "and dryland trees with clearly separated and visible crowns."
-)
-st.error(
-    "❌ Not suitable for: Dense canopy forests, conifer/pine forests, "
-    "early stage crop fields, or mixed terrain images."
-)
-
-st.markdown("Upload a drone orthomosaic image to analyze vegetation health, canopy coverage, and tree count.")
-
 st.info(
-    "📌 Best results with high resolution orthomosaic images (JPG/PNG/TIF) "
-    "taken from directly above on a clear sunny day."
+    "📌 Upload a top-down drone orthomosaic image to analyze vegetation health, "
+    "canopy coverage, and tree crown count."
+)
+
+st.success(
+    "✅ Sparse Forest / Dryland Mode — Works best for: Desert trees, savanna, "
+    "dryland forests, olive orchards, and any sparse vegetation on dry or sandy soil "
+    "where individual tree crowns are clearly visible and separated.\n\n"
+    "✅ Agriculture / Plantation Mode — Works best for: Fruit orchards, mango/citrus "
+    "plantations, and agroforestry plots with bright green round crowns in rows "
+    "with visible soil gaps between trees. Image must be taken from directly above."
 )
 
 uploaded_file = st.file_uploader(
@@ -321,7 +324,10 @@ if uploaded_file:
     mode = st.selectbox(
         "Select Analysis Mode",
         ["🌳 Sparse Forest / Dryland", "🌾 Agriculture / Plantation (Experimental)"],
-        help="Forest mode = stricter detection. Agriculture = sensitive for row crops and orchards."
+        help=(
+            "Sparse Forest / Dryland: For desert trees, savanna, olive orchards, dry soil plantations. "
+            "Agriculture / Plantation: For bright green fruit orchards and plantation rows."
+        )
     )
 
     k_value = st.slider(
@@ -399,7 +405,7 @@ if uploaded_file:
             else:
                 display_health = health_map
 
-            crown_message = get_crown_message(canopy_pct, tree_count)
+            crown_message = get_crown_message(canopy_pct, tree_count, mode)
 
         st.success("✅ Analysis Complete!")
         st.markdown("---")
@@ -441,7 +447,7 @@ if uploaded_file:
         else:
             st.warning(
                 "⚠️ Accuracy Note: Health Map ~65-75% | Canopy ~75-85% | "
-                "Tree Count ~70-85% sparse / ~50-65% dense. "
+                "Tree Count ~70-85% sparse / ~60-75% plantation. "
                 "For carbon verification, ground truth validation is recommended."
             )
 
